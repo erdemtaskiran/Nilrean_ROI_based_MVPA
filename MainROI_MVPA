@@ -1,0 +1,383 @@
+import os
+import numpy as np
+import pandas as pd
+from nilearn import image, plotting
+from nilearn.input_data import NiftiMasker
+from sklearn.svm import LinearSVC
+from sklearn.dummy import DummyClassifier
+from sklearn.model_selection import LeaveOneGroupOut, cross_val_score
+from sklearn.metrics import classification_report
+import matplotlib.pyplot as plt
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+def load_and_prepare_data(csv_path):
+    """Load data from CSV and prepare it for ROI analysis."""
+    # Load CSV
+    df = pd.read_csv(csv_path)
+    print(f"Loaded data for {len(df)} beta maps")
+    
+    # Filter for depression group only
+    df = df[df['group'] == 'depression']
+    print(f"Filtered to {len(df)} beta maps from depression group")
+    
+    # Recode targets to focus on valence (0: Positive, 1: Negative) for sklearn
+    df['valence'] = np.where(df['target'].isin([1, 2]), 0, 1)
+    
+    # Print data summary
+    print("\nData Summary (Depression Group Only):")
+    print(f"Total samples: {len(df)}")
+    print(f"Positive samples (0): {sum(df['valence'] == 0)}")
+    print(f"Negative samples (1): {sum(df['valence'] == 1)}")
+    print(f"Number of subjects: {len(df['subject'].unique())}")
+    
+    # Check data balance per subject
+    print("\nData balance per subject:")
+    for subject in sorted(df['subject'].unique()):
+        subj_data = df[df['subject'] == subject]
+        pos_count = sum(subj_data['valence'] == 0)
+        neg_count = sum(subj_data['valence'] == 1)
+        print(f"Subject {subject}: {pos_count} positive, {neg_count} negative")
+    
+    # Load all beta images
+    beta_imgs = [image.load_img(f) for f in df['beta_file']]
+    
+    # Get labels and subject IDs
+    labels = df['valence'].values
+    subject_ids = df['subject'].values
+    
+    return beta_imgs, labels, subject_ids, df
+
+def setup_roi_masks(masks_dir):
+    """Set up ROI masks for analysis."""
+    print(f"\nLoading ROI masks from: {masks_dir}")
+    
+    # Define mask files
+    mask_files = {
+        'ACC': 'ACC_bin.nii',
+        'Occipital': 'occipital_bin.nii', 
+        'Right_Amygdala': 'Right_Amygdala_bin.nii'
+    }
+    
+    mask_paths = []
+    roi_labels = []
+    
+    for roi_name, filename in mask_files.items():
+        mask_path = os.path.join(masks_dir, filename)
+        if os.path.exists(mask_path):
+            mask_paths.append(mask_path)
+            roi_labels.append(roi_name)
+            print(f"  ✓ Found: {roi_name}")
+        else:
+            print(f"  ✗ Missing: {roi_name}")
+    
+    if not mask_paths:
+        raise ValueError("No valid mask files found!")
+    
+    print(f"Successfully loaded {len(mask_paths)} ROI masks")
+    return mask_paths, roi_labels
+
+def extract_roi_signals(beta_imgs, mask_paths, roi_labels):
+    """Extract signals from ROI masks."""
+    print(f"\nExtracting signals from {len(mask_paths)} ROIs...")
+    
+    # Concatenate beta images
+    beta_4d = image.concat_imgs(beta_imgs)
+    print(f"Beta images shape: {beta_4d.shape}")
+    
+    all_signals = []
+    valid_rois = []
+    
+    for mask_path, roi_name in zip(mask_paths, roi_labels):
+        print(f"\nProcessing {roi_name}...")
+        
+        try:
+            # Load mask
+            mask_img = image.load_img(mask_path)
+            mask_data = mask_img.get_fdata()
+            n_voxels = np.sum(mask_data > 0)
+            
+            print(f"  Mask shape: {mask_img.shape}")
+            print(f"  Non-zero voxels: {n_voxels}")
+            
+            if n_voxels == 0:
+                print(f"  ✗ Empty mask - skipping")
+                continue
+            
+            # Initialize masker (same as Haxby example)
+            masker = NiftiMasker(
+                mask_img=mask_img,
+                standardize=True,
+                memory='nilearn_cache',
+                verbose=0
+            )
+            
+            # Extract signals
+            roi_signal = masker.fit_transform(beta_4d)
+            print(f"  Extracted signal shape: {roi_signal.shape}")
+            
+            # Take mean across voxels if multiple voxels
+            if roi_signal.shape[1] > 1:
+                roi_signal_mean = np.mean(roi_signal, axis=1, keepdims=True)
+                print(f"  Averaged across {roi_signal.shape[1]} voxels")
+            else:
+                roi_signal_mean = roi_signal
+                print(f"  Single voxel ROI")
+            
+            all_signals.append(roi_signal_mean)
+            valid_rois.append(roi_name)
+            print(f"  ✓ Successfully processed")
+            
+        except Exception as e:
+            print(f"  ✗ ERROR: {str(e)}")
+            continue
+    
+    if not all_signals:
+        raise ValueError("No valid signals extracted!")
+    
+    combined_signals = np.hstack(all_signals)
+    print(f"\nFinal combined signals shape: {combined_signals.shape}")
+    print(f"Successfully processed ROIs: {valid_rois}")
+    
+    return combined_signals, valid_rois
+
+def run_roi_classification(roi_signals, labels, subject_ids, roi_labels):
+    """Run classification analysis for each ROI (Haxby style)."""
+    print(f"\nRunning ROI-based classification...")
+    
+    # Initialize classifiers (same as Haxby example)
+    svm = LinearSVC(dual=False, max_iter=10000, random_state=42)
+    dummy = DummyClassifier(strategy='stratified', random_state=42)
+    cv = LeaveOneGroupOut()
+    
+    results = []
+    
+    for roi_idx, roi_name in enumerate(roi_labels):
+        print(f"\nProcessing {roi_name} ({roi_idx + 1}/{len(roi_labels)})...")
+        
+        # Get data for this ROI
+        roi_data = roi_signals[:, roi_idx].reshape(-1, 1)
+        
+        # SVM classification with cross-validation
+        svm_scores = cross_val_score(
+            svm, roi_data, labels, 
+            groups=subject_ids, 
+            cv=cv, 
+            scoring='roc_auc'
+        )
+        
+        # Dummy classifier for comparison
+        dummy_scores = cross_val_score(
+            dummy, roi_data, labels,
+            groups=subject_ids,
+            cv=cv,
+            scoring='roc_auc'
+        )
+        
+        # Calculate means and stats
+        svm_mean = np.mean(svm_scores)
+        svm_std = np.std(svm_scores)
+        dummy_mean = np.mean(dummy_scores)
+        dummy_std = np.std(dummy_scores)
+        
+        # Statistical test (t-test between SVM and dummy)
+        t_stat, p_value = stats.ttest_rel(svm_scores, dummy_scores)
+        
+        print(f"  SVM AUC: {svm_mean:.3f} ± {svm_std:.3f}")
+        print(f"  Dummy AUC: {dummy_mean:.3f} ± {dummy_std:.3f}")
+        print(f"  Difference: {svm_mean - dummy_mean:.3f}")
+        print(f"  T-statistic: {t_stat:.3f}, p-value: {p_value:.4f}")
+        
+        # Store results
+        results.append({
+            'roi_name': roi_name,
+            'svm_auc': svm_mean,
+            'svm_std': svm_std,
+            'dummy_auc': dummy_mean,
+            'dummy_std': dummy_std,
+            'difference': svm_mean - dummy_mean,
+            't_statistic': t_stat,
+            'p_value': p_value,
+            'significant': p_value < 0.05
+        })
+    
+    return pd.DataFrame(results)
+
+def create_visualizations(results_df, output_dir):
+    """Create simple visualizations (Haxby style)."""
+    plt.figure(figsize=(14, 10))
+    
+    # 1. AUC comparison plot
+    plt.subplot(2, 2, 1)
+    x = np.arange(len(results_df))
+    width = 0.35
+    
+    colors_svm = ['red' if sig else 'blue' for sig in results_df['significant']]
+    colors_dummy = ['lightcoral' if sig else 'lightblue' for sig in results_df['significant']]
+    
+    plt.bar(x - width/2, results_df['svm_auc'], width, 
+            label='SVM', color=colors_svm, alpha=0.8,
+            yerr=results_df['svm_std'], capsize=5)
+    plt.bar(x + width/2, results_df['dummy_auc'], width,
+            label='Dummy', color=colors_dummy, alpha=0.8,
+            yerr=results_df['dummy_std'], capsize=5)
+    
+    plt.axhline(y=0.5, color='black', linestyle='--', alpha=0.7, label='Chance (0.5)')
+    plt.ylabel('AUC Score')
+    plt.title('SVM vs Dummy Classifier Performance')
+    plt.xticks(x, results_df['roi_name'], rotation=45, ha='right')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.ylim(0.4, 1.0)
+    
+    # 2. Performance difference
+    plt.subplot(2, 2, 2)
+    colors = ['red' if sig else 'blue' for sig in results_df['significant']]
+    bars = plt.bar(results_df['roi_name'], results_df['difference'], 
+                   color=colors, alpha=0.8)
+    plt.axhline(y=0, color='black', linestyle='-', alpha=0.7)
+    plt.ylabel('AUC Difference (SVM - Dummy)')
+    plt.title('Classification Improvement over Chance')
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(True, alpha=0.3)
+    
+    # Add values on bars
+    for bar, diff in zip(bars, results_df['difference']):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005, 
+                f'{diff:.3f}', ha='center', va='bottom', fontweight='bold')
+    
+    # 3. Statistical significance
+    plt.subplot(2, 2, 3)
+    colors = ['red' if sig else 'blue' for sig in results_df['significant']]
+    bars = plt.bar(results_df['roi_name'], -np.log10(results_df['p_value']), 
+                   color=colors, alpha=0.8)
+    plt.axhline(y=-np.log10(0.05), color='red', linestyle='--', alpha=0.7, 
+                label='p < 0.05')
+    plt.ylabel('-log10(p-value)')
+    plt.title('Statistical Significance')
+    plt.xticks(rotation=45, ha='right')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 4. Summary table
+    plt.subplot(2, 2, 4)
+    plt.axis('off')
+    
+    summary_data = []
+    for _, row in results_df.iterrows():
+        summary_data.append([
+            row['roi_name'],
+            f"{row['svm_auc']:.3f}",
+            f"{row['dummy_auc']:.3f}",
+            f"{row['difference']:.3f}",
+            f"{row['p_value']:.4f}",
+            "Yes" if row['significant'] else "No"
+        ])
+    
+    table = plt.table(cellText=summary_data,
+                     colLabels=['ROI', 'SVM AUC', 'Dummy AUC', 'Difference', 'P-value', 'Significant'],
+                     cellLoc='center',
+                     loc='center',
+                     bbox=[0, 0, 1, 1])
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 2)
+    
+    # Color significant rows
+    for i, sig in enumerate(results_df['significant']):
+        if sig:
+            for j in range(6):
+                table[(i+1, j)].set_facecolor('#ffcccc')
+    
+    plt.title('Summary Results', pad=20)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'depression_roi_analysis.png'), 
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+def main():
+    """Main function to run ROI-based analysis (Haxby style)."""
+    
+    # Set up paths
+    csv_path = "/Users/erdemtaskiran/Desktop/nilearn_searchlight_results/searchlight_data.csv"
+    output_dir = "/Users/erdemtaskiran/Desktop/claude_output/depression_roi"
+    masks_dir = "/Users/erdemtaskiran/Desktop/masks"
+    
+    print("=" * 80)
+    print("ROI-BASED MVPA ANALYSIS (HAXBY STYLE - DEPRESSION GROUP)")
+    print("=" * 80)
+    print("Analysis Parameters:")
+    print("- ROIs: ACC, Occipital, Right Amygdala")
+    print("- Metric: AUC (Area Under ROC Curve)")
+    print("- Comparison: SVM vs Dummy Classifier")
+    print("- Cross-validation: Leave-one-subject-out")
+    print("- Statistical test: Paired t-test")
+    print("=" * 80)
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load and prepare data
+    beta_imgs, labels, subject_ids, df = load_and_prepare_data(csv_path)
+    
+    # Set up ROI masks
+    mask_paths, roi_labels = setup_roi_masks(masks_dir)
+    
+    # Extract ROI signals
+    roi_signals, valid_roi_labels = extract_roi_signals(beta_imgs, mask_paths, roi_labels)
+    
+    # Run ROI classification
+    results_df = run_roi_classification(roi_signals, labels, subject_ids, valid_roi_labels)
+    
+    # Save results
+    results_path = os.path.join(output_dir, 'depression_roi_results.csv')
+    results_df.to_csv(results_path, index=False)
+    print(f"\nResults saved to: {results_path}")
+    
+    # Create visualizations
+    print("\nCreating visualizations...")
+    create_visualizations(results_df, output_dir)
+    
+    # Print summary
+    print("\n" + "=" * 80)
+    print("ANALYSIS COMPLETE!")
+    print("=" * 80)
+    print(f"Results directory: {output_dir}")
+    print(f"\nTotal ROIs analyzed: {len(results_df)}")
+    print(f"ROIs with AUC > 0.6: {np.sum(results_df['svm_auc'] > 0.6)}")
+    print(f"Significant ROIs (p < 0.05): {np.sum(results_df['significant'])}")
+    
+    # Print detailed results
+    print(f"\nDetailed Results:")
+    print("-" * 80)
+    for _, row in results_df.iterrows():
+        significance = "***" if row['significant'] else ""
+        print(f"{row['roi_name']:15} | SVM: {row['svm_auc']:.3f} ± {row['svm_std']:.3f} | "
+              f"Dummy: {row['dummy_auc']:.3f} | Diff: {row['difference']:+.3f} | "
+              f"p: {row['p_value']:.4f} {significance}")
+    
+    if np.sum(results_df['significant']) > 0:
+        best_roi = results_df.loc[results_df['svm_auc'].idxmax()]
+        print(f"\nBest performing ROI:")
+        print(f"  {best_roi['roi_name']}")
+        print(f"  SVM AUC: {best_roi['svm_auc']:.3f} ± {best_roi['svm_std']:.3f}")
+        print(f"  Improvement over dummy: {best_roi['difference']:.3f}")
+        print(f"  P-value: {best_roi['p_value']:.4f}")
+    
+    print(f"\nOutput files:")
+    print("1. depression_roi_results.csv - Complete results table")
+    print("2. depression_roi_analysis.png - ROI analysis visualizations")
+    
+    print(f"\n" + "=" * 80)
+    print("INTERPRETATION:")
+    print("• AUC = 0.5: Chance level (no information)")
+    print("• AUC > 0.6: Good decoding performance")
+    print("• AUC > 0.7: Excellent decoding performance")
+    print("• Red bars: Significantly better than dummy classifier")
+    print("• Blue bars: Not significantly different from dummy")
+    print("=" * 80)
+
+if __name__ == "__main__":
+    main()
